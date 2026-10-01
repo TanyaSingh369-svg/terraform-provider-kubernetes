@@ -9,103 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-provider-kubernetes/kubernetes"
 	rbacv1api "k8s.io/api/rbac/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-// ── String map helpers ────────────────────────────────────────────────────────
-
-// expandStringMap converts map[string]types.String → map[string]string for Kubernetes API calls.
-func expandStringMap(m map[string]types.String) map[string]string {
-	if m == nil {
-		return nil
-	}
-	result := make(map[string]string, len(m))
-	for k, v := range m {
-		if !v.IsNull() && !v.IsUnknown() {
-			result[k] = v.ValueString()
-		}
-	}
-	return result
-}
-
-// flattenStringMap converts map[string]string → map[string]types.String.
-func flattenStringMap(m map[string]string) map[string]types.String {
-	if m == nil {
-		return nil
-	}
-	result := make(map[string]types.String, len(m))
-	for k, v := range m {
-		result[k] = types.StringValue(v)
-	}
-	return result
-}
-
-// toStringInterfaceMap converts map[string]types.String → map[string]interface{}
-// as required by kubernetes.DiffStringMap.
-func toStringInterfaceMap(m map[string]types.String) map[string]interface{} {
-	result := make(map[string]interface{}, len(m))
-	for k, v := range m {
-		if !v.IsNull() && !v.IsUnknown() {
-			result[k] = v.ValueString()
-		}
-	}
-	return result
-}
-
-// ── Metadata helpers ──────────────────────────────────────────────────────────
-
-// filterIgnoredMetadataKeys removes internal Kubernetes keys and keys matching
-// ignore patterns — unless that key is already present in current (managed by TF).
-func filterIgnoredMetadataKeys(meta map[string]string, current map[string]types.String, ignorePatterns []string) map[string]string {
-	result := make(map[string]string, len(meta))
-	for k, v := range meta {
-		_, managedByTF := current[k]
-		if !managedByTF && (kubernetes.IsInternalKey(k) || kubernetes.IgnoreKey(k, ignorePatterns)) {
-			continue
-		}
-		result[k] = v
-	}
-	return result
-}
-
-// flattenNamespacedMetadata converts a Kubernetes ObjectMeta to NamespacedMetadataModel,
-// filtering out internal Kubernetes keys and user-configured ignore patterns.
-// current holds the existing Terraform-managed metadata (used to preserve user-managed keys).
-func flattenNamespacedMetadata(meta metav1.ObjectMeta, current NamespacedMetadataModel, ignoreAnnotations, ignoreLabels []string) NamespacedMetadataModel {
-	result := NamespacedMetadataModel{
-		Name:            types.StringValue(meta.Name),
-		Namespace:       types.StringValue(meta.Namespace),
-		Generation:      types.Int64Value(meta.Generation),
-		ResourceVersion: types.StringValue(meta.ResourceVersion),
-		UID:             types.StringValue(string(meta.UID)),
-	}
-
-	// generate_name: only set if non-empty to avoid perpetual diff vs nil
-	if meta.GenerateName != "" {
-		result.GenerateName = types.StringValue(meta.GenerateName)
-	} else {
-		result.GenerateName = types.StringNull()
-	}
-
-	filtered := filterIgnoredMetadataKeys(meta.Annotations, current.Annotations, ignoreAnnotations)
-	// Preserve non-null empty map when the user explicitly configured annotations = {}.
-	// Without this, annotations={} in config would flatten to null and cause an
-	// inconsistent-result error on the next plan.
-	if len(filtered) > 0 {
-		result.Annotations = flattenStringMap(filtered)
-	} else if current.Annotations != nil {
-		result.Annotations = map[string]types.String{}
-	}
-
-	filtered = filterIgnoredMetadataKeys(meta.Labels, current.Labels, ignoreLabels)
-	if len(filtered) > 0 {
-		result.Labels = flattenStringMap(filtered)
-	} else if current.Labels != nil {
-		result.Labels = map[string]types.String{}
-	}
-
-	return result
-}
 
 // ── RoleRef helpers ───────────────────────────────────────────────────────────
 
@@ -145,18 +49,76 @@ func expandSubjects(in []SubjectModel) []rbacv1api.Subject {
 }
 
 // flattenSubjects converts Kubernetes Subject API objects to a slice of SubjectModel.
+// When a subject has no namespace (e.g. User or Group kinds), the Kubernetes API
+// returns an empty string. The schema declares Default: "default" for namespace, which
+// Terraform applies during planning but not during Read. To keep state consistent with
+// the plan default — and to match SDKv2 behaviour (Default: "default" in schema_rbac.go)
+// — we write "default" whenever the API returns an empty namespace.
 func flattenSubjects(in []rbacv1api.Subject) []SubjectModel {
 	result := make([]SubjectModel, 0, len(in))
 	for _, s := range in {
+		ns := s.Namespace
+		if ns == "" {
+			ns = "default"
+		}
 		m := SubjectModel{
 			Kind:      types.StringValue(s.Kind),
 			Name:      types.StringValue(s.Name),
 			APIGroup:  types.StringValue(s.APIGroup),
-			Namespace: types.StringValue(s.Namespace),
+			Namespace: types.StringValue(ns),
 		}
 		result = append(result, m)
 	}
 	return result
+}
+
+// applySubjectComputedFields resolves unknown computed fields in plan subjects from the
+// Kubernetes API response, while preserving all configured values.
+//
+// subject.api_group is Optional+Computed with no default. When a subject is configured
+// without api_group (e.g. a ServiceAccount), the plan carries an unknown value for that
+// field. After the API call succeeds, Kubernetes returns a concrete value. This helper
+// fills in only those unknown slots; configured (known) values are left untouched.
+//
+// If the response has a different number of subjects than the plan — which should not
+// happen in practice but is possible if the server normalised the request — we fall back
+// to a full flatten for the mismatched tail so the state is still consistent.
+func applySubjectComputedFields(plan *[]SubjectModel, apiSubjects []rbacv1api.Subject) {
+	for i := range *plan {
+		if i >= len(apiSubjects) {
+			break
+		}
+		s := &(*plan)[i]
+		api := apiSubjects[i]
+
+		// Resolve api_group only when the plan left it unknown (omitted by the caller).
+		if s.APIGroup.IsUnknown() {
+			s.APIGroup = types.StringValue(api.APIGroup)
+		}
+		// Resolve namespace only when the plan left it unknown.
+		if s.Namespace.IsUnknown() {
+			ns := api.Namespace
+			if ns == "" {
+				ns = "default"
+			}
+			s.Namespace = types.StringValue(ns)
+		}
+	}
+
+	// Append any extra API subjects that have no matching plan entry.
+	for i := len(*plan); i < len(apiSubjects); i++ {
+		api := apiSubjects[i]
+		ns := api.Namespace
+		if ns == "" {
+			ns = "default"
+		}
+		*plan = append(*plan, SubjectModel{
+			Kind:      types.StringValue(api.Kind),
+			Name:      types.StringValue(api.Name),
+			APIGroup:  types.StringValue(api.APIGroup),
+			Namespace: types.StringValue(ns),
+		})
+	}
 }
 
 // ── Subject patch helper ──────────────────────────────────────────────────────
@@ -170,9 +132,9 @@ func patchSubjects(old, new []SubjectModel) kubernetes.PatchOperations {
 
 	ops := make(kubernetes.PatchOperations, 0, len(newExpanded)+len(oldExpanded))
 
-	common := len(newExpanded)
-	if common > len(oldExpanded) {
-		common = len(oldExpanded)
+	commonLen := len(newExpanded)
+	if commonLen > len(oldExpanded) {
+		commonLen = len(oldExpanded)
 	}
 
 	// Remove trailing old entries first (reverse order to keep indices stable)
@@ -185,7 +147,7 @@ func patchSubjects(old, new []SubjectModel) kubernetes.PatchOperations {
 	}
 
 	// Replace entries that exist in both old and new
-	for i, v := range newExpanded[:common] {
+	for i, v := range newExpanded[:commonLen] {
 		ops = append(ops, &kubernetes.ReplaceOperation{
 			Path:  "/subjects/" + strconv.Itoa(i),
 			Value: v,
@@ -194,9 +156,9 @@ func patchSubjects(old, new []SubjectModel) kubernetes.PatchOperations {
 
 	// Add new entries beyond the old length
 	if len(newExpanded) > len(oldExpanded) {
-		for i, v := range newExpanded[common:] {
+		for i, v := range newExpanded[commonLen:] {
 			ops = append(ops, &kubernetes.AddOperation{
-				Path:  "/subjects/" + strconv.Itoa(common+i),
+				Path:  "/subjects/" + strconv.Itoa(commonLen+i),
 				Value: v,
 			})
 		}
